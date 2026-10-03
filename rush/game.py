@@ -1,60 +1,60 @@
-"""Run flow: menu, street, goals, and the read before the next sky."""
+"""Menu, course flow, and the motorcycle step."""
 
 from __future__ import annotations
 
-import math
-import random
-
 import pygame
-from pygame.math import Vector2
 
-from .bike import Input, Player
-from .goals import Analyzer, Objective
-from .settings import (
-    BOOST_MAX_SPEED,
-    FPS,
-    GOALS_PER_STAGE,
-    SCREEN_H,
-    SCREEN_W,
-    STAGES,
-    cruise_speed,
-    kmh,
-)
-from .sky import WorldBackground
-from .street import Street
+from .bike import Bike, Input
+from .course import Course
+from .settings import FPS, LEVELS, SCREEN_H, SCREEN_W, weight_of
 from .view import View
+
+
+def score_landing(air: float, error: float, limit: float, spin: float) -> tuple[int, str]:
+    """Points for a real jump. A tiny hop scores nothing."""
+    if air < 0.32:
+        return 0, ""
+    hang = int(air * 140)
+    match = max(0.0, 1.0 - error / max(0.2, limit))
+    clean = int(90 * match)
+    turned = int(min(spin, 1.6) * 35)
+    total = hang + clean + turned
+    if match > 0.72 and air >= 0.55:
+        label = "CLEAN HANG"
+    elif match > 0.72:
+        label = "CLEAN"
+    elif air >= 0.7:
+        label = "LONG AIR"
+    else:
+        label = "LANDED"
+    return total, label
 
 
 class Game:
     def __init__(self):
         self.time = 0.0
+        self.race_time = 0.0
         self.state = "menu"
         self.quit_requested = False
-        self.stage_index = 0
-        self.points = 0
-        self.cleared = 0
-        self.goal: Objective | None = None
-        self.analyzer = Analyzer()
-        self.player = Player()
-        self.street = Street(STAGES[0]["seed"], 0, STAGES[0]["scene"])
-        self.callout_t = 0.0
-        self.shake = 0.0
+        self.level_index = 0
+        self.bike = Bike()
+        self.course = Course(LEVELS[0])
+        self.bike.reset(self.course)
+        self.countdown = 0.0
+        self.clear_t = 0.0
         self.toast_text = ""
         self.toast_t = 0.0
-        self.jump_buffer = 0.0
-        self.particles: list[dict] = []
-        self.cam = Vector2()
-        self.zoom = 1.0
-        self.countdown = 0.0
-        self.analyze_t = 0.0
-        self.pending_goal: Objective | None = None
-        self.pending_phrase = ""
-        self.analyze_lines: list[str] = []
-        self.next_name = ""
-        self.backdrop = WorldBackground(STAGES[0])
+        self.cam_x = 0.0
+        self.cam_y = 0.0
+        self.hinted_air = False
+        self.score = 0
+        self.level_score = 0
+        self.run_time = 0.0
+        self.shake = 0.0
+        self._snap_camera()
 
-    def _stage(self):
-        return STAGES[self.stage_index]
+    def level(self):
+        return LEVELS[self.level_index]
 
     def handle(self, event):
         if event.type != pygame.KEYDOWN:
@@ -68,18 +68,16 @@ class Game:
         elif self.state == "race":
             if key == pygame.K_ESCAPE:
                 self.state = "pause"
-            elif key == pygame.K_SPACE:
-                self.jump_buffer = 0.14
         elif self.state == "pause":
             if key in (pygame.K_ESCAPE, pygame.K_RETURN):
                 self.state = "race"
             elif key == pygame.K_r:
-                self._restart_stage()
+                self._open_level()
             elif key == pygame.K_m:
                 self.state = "menu"
         elif self.state == "failed":
             if key in (pygame.K_r, pygame.K_RETURN, pygame.K_SPACE):
-                self._restart_stage()
+                self._open_level()
             elif key == pygame.K_ESCAPE:
                 self.state = "menu"
         elif self.state == "victory":
@@ -89,211 +87,113 @@ class Game:
                 self.state = "menu"
 
     def start_run(self):
-        self.stage_index = 0
-        self.points = 0
-        self._open_stage(fresh_player=True)
+        self.level_index = 0
+        self.score = 0
+        self.level_score = 0
+        self.run_time = 0.0
+        self._open_level(keep_score=True)
 
-    def _restart_stage(self):
-        self._open_stage(fresh_player=True)
-
-    def _open_stage(self, fresh_player: bool):
-        stage = self._stage()
-        if fresh_player:
-            self.player.reset()
-        self.player.gravity_scale = stage["gravity"]
-        self.backdrop = WorldBackground(stage)
-        self.street = Street(stage["seed"], self.stage_index, stage["scene"])
-        self.analyzer.begin_level()
-        self.cleared = 0
-        kind = self.analyzer.kind_while_playing(stage["scene"], 0, "")
-        self._arm(self.analyzer.make(kind, self.stage_index, stage["gravity"]))
-        self.street.reset(self.player.y, self.goal.kind)
+    def _open_level(self, keep_score=False):
+        if not keep_score:
+            self.score -= self.level_score
+        self.level_score = 0
+        self.course = Course(self.level())
+        self.bike.reset(self.course)
         self.countdown = 3.0
-        self.jump_buffer = 0.0
+        self.race_time = 0.0
+        self.clear_t = 0.0
         self.toast_t = 0.0
+        self.hinted_air = False
         self.shake = 0.0
-        self.particles.clear()
         self.state = "race"
-        self.cam = Vector2(0, self.player.y - 200)
-
-    def _arm(self, goal: Objective):
-        self.goal = goal
-        self.analyzer.begin_window()
-        self.street.set_pattern(goal.kind)
-        self.callout_t = 1.4
-        self.toast(goal.hud)
+        name, _color, mult = weight_of(self.level())
+        self.toast(f"{name}  {mult:.2f}x")
+        self._snap_camera()
 
     def toast(self, text: str):
         self.toast_text = text
-        self.toast_t = 1.45
+        self.toast_t = 1.6
 
     def update(self, dt: float):
         dt = min(max(dt, 0.0), 0.05)
         if self.state == "pause":
             return
         self.time += dt
-        self.callout_t = max(0.0, self.callout_t - dt)
         self.toast_t = max(0.0, self.toast_t - dt)
-        self.jump_buffer = max(0.0, self.jump_buffer - dt)
-        self._update_particles(dt)
         if self.shake > 0:
-            self.shake = max(0.0, self.shake - dt * 18)
-
+            self.shake = max(0.0, self.shake - dt * 16)
         if self.state == "menu":
+            self._snap_camera()
             return
-        if self.state == "analyze":
-            self.analyze_t -= dt
-            if self.analyze_t <= 0:
-                self._finish_analyze()
+        if self.state == "clear":
+            self.clear_t -= dt
+            self._follow_camera(dt)
+            if self.clear_t <= 0.0:
+                self._advance()
             return
         if self.state in ("failed", "victory"):
             return
 
-        keys = pygame.key.get_pressed()
-        racing = self.countdown <= 0 and self.state == "race"
-        steer = 0.0
-        if keys[pygame.K_a] or keys[pygame.K_LEFT]:
-            steer += 1.0
-        if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
-            steer -= 1.0
-        inp = Input(
-            accel=racing and (keys[pygame.K_w] or keys[pygame.K_UP]),
-            brake=racing and (keys[pygame.K_s] or keys[pygame.K_DOWN]),
-            steer=steer if racing else 0.0,
-            boost=racing and (keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]),
-            jump=racing and self.jump_buffer > 0.0,
-        )
-
-        if self.countdown > 0:
+        if self.countdown > 0.0:
             self.countdown -= dt
-            if self.countdown <= 0:
-                self.countdown = 0
+            if self.countdown <= 0.0:
+                self.countdown = 0.0
                 self.toast("GO")
-        else:
-            self.player.update(dt, inp)
-            if self.player.jumped:
-                self.jump_buffer = 0.0
-                self.analyzer.note("jump")
-            if self.player.shake:
-                self.shake = max(self.shake, self.player.shake)
-                self.player.shake = 0.0
-            for event in self.street.resolve(self.player):
-                self.analyzer.note(event)
-                if event == "hit":
-                    self.player.bump()
-                    self.shake = max(self.shake, self.player.shake)
-                    self.player.shake = 0.0
-                    self.toast("HIT")
-                    self.burst(self.player.pos, (255, 80, 70), 12, 220)
-            self.street.ensure(self.player.y)
-            self.street.cull(self.player.y)
-            speed_kmh = kmh(self.player.speed)
-            self.analyzer.tick_speed(dt, self.player.grounded and speed_kmh >= self._pace_mark())
-            self.analyzer.tick_distance(self.player.speed * dt)
-            if self.player.boosting:
-                tail = self.player.pos + Vector2(0, 22)
-                if random.random() < 0.65:
-                    self.burst(tail, (255, 210, 90), 2, 80)
-            self._tick_goal(dt)
+            self._follow_camera(dt)
+            return
 
+        self.race_time += dt
+        self.run_time += dt
+        keys = pygame.key.get_pressed()
+        inp = Input(
+            gas=keys[pygame.K_w] or keys[pygame.K_UP] or keys[pygame.K_d] or keys[pygame.K_RIGHT],
+            brake=keys[pygame.K_s] or keys[pygame.K_DOWN] or keys[pygame.K_a] or keys[pygame.K_LEFT],
+        )
+        was_air = not self.bike.grounded
+        self.bike.update(dt, inp, self.course)
+        if self.bike.just_landed:
+            self._award_landing()
+        if self.bike.crashed:
+            self.toast(self.bike.crash_reason)
+            self.state = "failed"
+        elif not was_air and not self.bike.grounded and not self.hinted_air:
+            self.hinted_air = True
+            self.toast("W NOSE UP    S NOSE DOWN")
+        elif self.bike.x >= self.course.length:
+            self.toast("LEVEL CLEAR")
+            self.state = "clear"
+            self.clear_t = 1.3
         self._follow_camera(dt)
 
-    def _pace_mark(self) -> int:
-        if self.goal and self.goal.kind == "speed":
-            return self.goal.mark
-        return int(kmh(cruise_speed(self._stage()["gravity"])) * 0.90)
-
-    def _tick_goal(self, dt: float):
-        goal = self.goal
-        if goal is None or self.state != "race":
+    def _award_landing(self):
+        bike = self.bike
+        bike.just_landed = False
+        gained, label = score_landing(bike.land_air, bike.land_error, self.course.land, bike.land_spin)
+        if gained <= 0:
             return
-        goal.left -= dt
-        if self.analyzer.met(goal):
-            self.points += goal.bonus
-            self.player.boost = min(100.0, self.player.boost + 18)
-            self.cleared += 1
-            self.burst(self.player.pos, (230, 255, 220), 10, 160)
-            if self.cleared >= GOALS_PER_STAGE:
-                self._enter_analyze()
-            else:
-                kind = self.analyzer.kind_while_playing(self._stage()["scene"], self.cleared, goal.kind)
-                self._arm(self.analyzer.make(kind, self.stage_index, self._stage()["gravity"]))
-            return
-        if goal.left <= 0:
-            goal.left = 0
-            self.toast("STATUS EXPIRED")
-            self.state = "failed"
+        self.score += gained
+        self.level_score += gained
+        self.toast(f"+{gained}  {label}")
+        if self.course.gravity > 1800 and bike.land_air > 0.25:
+            self.shake = min(11.0, 5.0 + self.course.gravity / 500.0)
 
-    def _enter_analyze(self):
-        last = self.stage_index >= len(STAGES) - 1
-        if last:
-            kind = self.analyzer.kind_before_change(self._stage()["scene"])
-            self.next_name = ""
-        else:
-            nxt = STAGES[self.stage_index + 1]
-            kind = self.analyzer.kind_before_change(nxt["scene"])
-            self.pending_goal = self.analyzer.make(kind, self.stage_index + 1, nxt["gravity"])
-            self.next_name = nxt["name"]
-        self.pending_phrase = self.analyzer.phrase(kind)
-        level = self.analyzer.level
-        self.analyze_lines = [
-            "READING YOUR RUN",
-            f"HITS {level.hits}    DODGES {level.dodges}    JUMPS {level.jumps}",
-            self.pending_phrase,
-        ]
-        self.analyze_t = 2.8
-        self.state = "analyze"
-        self.goal = None
-
-    def _finish_analyze(self):
-        if self.stage_index >= len(STAGES) - 1:
+    def _advance(self):
+        if self.level_index >= len(LEVELS) - 1:
             self.state = "victory"
             return
-        self.stage_index += 1
-        stage = self._stage()
-        self.player.gravity_scale = stage["gravity"]
-        self.backdrop = WorldBackground(stage)
-        self.street = Street(stage["seed"], self.stage_index, stage["scene"])
-        self.analyzer.begin_level()
-        self.cleared = 0
-        goal = self.pending_goal or self.analyzer.make("dodge", self.stage_index, stage["gravity"])
-        self.street.reset(self.player.y, goal.kind)
-        self.countdown = 0.0
-        self._arm(goal)
-        self.state = "race"
+        self.level_index += 1
+        self._open_level(keep_score=True)
 
-    def _follow_camera(self, dt):
-        target = Vector2(0, self.player.y - 200)
-        self.cam += (target - self.cam) * min(1.0, dt * 4.0)
-        speed = self.player.speed
-        target_zoom = 1.02 - min(0.10, speed / BOOST_MAX_SPEED * 0.10)
-        self.zoom += (target_zoom - self.zoom) * min(1.0, dt * 2.2)
+    def _snap_camera(self):
+        self.cam_x = self.bike.x + 280.0
+        self.cam_y = self.bike.y - 40.0
 
-    def burst(self, pos, color, count, speed):
-        for _ in range(count):
-            angle = random.random() * math.tau
-            mag = random.uniform(speed * 0.25, speed)
-            self.particles.append(
-                {
-                    "p": Vector2(pos),
-                    "v": Vector2(math.cos(angle), math.sin(angle)) * mag,
-                    "life": random.uniform(0.16, 0.38),
-                    "age": 0.0,
-                    "c": color,
-                    "s": random.randint(2, 4),
-                }
-            )
-
-    def _update_particles(self, dt):
-        alive = []
-        for speck in self.particles:
-            speck["age"] += dt
-            if speck["age"] >= speck["life"]:
-                continue
-            speck["p"] += speck["v"] * dt
-            speck["v"] *= 0.94
-            alive.append(speck)
-        self.particles = alive
+    def _follow_camera(self, dt: float):
+        target_x = self.bike.x + 280.0
+        target_y = self.bike.y - 40.0
+        rate = min(1.0, dt * 4.5)
+        self.cam_x += (target_x - self.cam_x) * rate
+        self.cam_y += (target_y - self.cam_y) * rate
 
 
 def main():

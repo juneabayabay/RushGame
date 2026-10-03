@@ -1,131 +1,154 @@
-"""Street bike. Forward is up the road. Lanes are left and right."""
+"""Side-view motorcycle.
+
+On the dirt it follows the slope. Off a ramp it is in the air: gravity pulls
+it down, and gas or brake rotates it until the wheels meet the ground.
+"""
 
 from __future__ import annotations
 
+import math
+
 from pygame.math import Vector2
 
-from .settings import (
-    ACCEL,
-    BOOST_ACCEL,
-    BOOST_DRAIN,
-    BOOST_MAX_SPEED,
-    BOOST_REGEN,
-    BRAKE,
-    FRICTION,
-    GRAVITY,
-    JUMP_SPEED,
-    LANE_RESPONSE,
-    LANE_X,
-    PLAYER_COLOR,
-    cruise_speed,
-)
+from .settings import ACCEL, AIR_TURN, BRAKE, FRICTION, MAX_SPEED, RIDE
 
 
 class Input:
-    def __init__(self, accel=False, brake=False, steer=0.0, boost=False, jump=False):
-        self.accel = accel
+    def __init__(self, gas=False, brake=False):
+        self.gas = gas
         self.brake = brake
-        self.steer = steer
-        self.boost = boost
-        self.jump = jump
 
 
-class Player:
+def wrap(angle: float) -> float:
+    return (angle + math.pi) % math.tau - math.pi
+
+
+class Bike:
     def __init__(self):
-        self.color = PLAYER_COLOR
-        self.gravity_scale = 1.0
-        self.trail: list[Vector2] = []
-        self._steer_held = False
-        self.reset()
+        self.color = (176, 80, 235)
+        self.reset_pose()
 
-    def reset(self):
+    def reset_pose(self):
+        self.x = 140.0
         self.y = 0.0
-        self.prev_y = 0.0
-        self.lane_index = 1
-        self.lane_x = float(LANE_X[1])
-        self.z = 0.0
-        self.vz = 0.0
+        self.vx = 0.0
+        self.vy = 0.0
         self.speed = 0.0
-        self.boost = 100.0
-        self.boosting = False
+        self.angle = 0.0
         self.grounded = True
-        self.invuln = 0.0
-        self.shake = 0.0
-        self.jumped = False
-        self.trail.clear()
-        self._steer_held = False
+        self.crashed = False
+        self.crash_reason = ""
+        self.air_time = 0.0
+        self.air_spin = 0.0
+        self.spin = 0.0
+        self.just_landed = False
+        self.land_air = 0.0
+        self.land_error = 0.0
+        self.land_spin = 0.0
+
+    def reset(self, course):
+        self.reset_pose()
+        self.x = 140.0
+        ground = course.ground(self.x)
+        self.y = (ground if ground is not None else course.base) - RIDE
+        self.angle = -course.slope(self.x)
 
     @property
     def pos(self) -> Vector2:
-        return Vector2(self.lane_x, self.y)
+        return Vector2(self.x, self.y)
 
-    def occupied_lanes(self) -> set[int]:
-        lanes = {index for index, lane_x in enumerate(LANE_X) if abs(self.lane_x - lane_x) < 72}
-        return lanes or {self.lane_index}
+    def local(self, lx: float, ly: float) -> tuple[float, float]:
+        """Bike space to world. Positive angle points the nose up."""
+        c = math.cos(self.angle)
+        s = math.sin(self.angle)
+        return (self.x + lx * c + ly * s, self.y - lx * s + ly * c)
 
-    def update(self, dt: float, inp: Input):
+    def update(self, dt: float, inp: Input, course):
         dt = min(max(dt, 0.0), 0.05)
-        self.prev_y = self.y
-        self.jumped = False
-        self.invuln = max(0.0, self.invuln - dt)
-        self.boosting = bool(inp.boost and self.boost > 0.0)
-        if self.boosting:
-            self.boost = max(0.0, self.boost - BOOST_DRAIN * dt)
+        if self.crashed:
+            return
+        if self.grounded:
+            self._drive(dt, inp, course)
         else:
-            self.boost = min(100.0, self.boost + BOOST_REGEN * dt)
+            self._fly(dt, inp, course)
+        self.spin += abs(self.speed) * dt
 
-        if inp.steer > 0.5:
-            if not self._steer_held:
-                self.lane_index = max(0, self.lane_index - 1)
-                self._steer_held = True
-        elif inp.steer < -0.5:
-            if not self._steer_held:
-                self.lane_index = min(len(LANE_X) - 1, self.lane_index + 1)
-                self._steer_held = True
-        else:
-            self._steer_held = False
-
-        target = LANE_X[self.lane_index]
-        self.lane_x += (target - self.lane_x) * min(1.0, dt * LANE_RESPONSE)
-
-        cruise = cruise_speed(self.gravity_scale)
-        if inp.brake:
+    def _drive(self, dt: float, inp: Input, course):
+        slope = course.slope(self.x)
+        self.angle = -slope
+        if inp.gas:
+            self.speed += ACCEL * dt
+        elif inp.brake:
             self.speed -= BRAKE * dt
-        elif inp.accel and self.boosting:
-            self.speed = min(BOOST_MAX_SPEED, self.speed + (ACCEL + BOOST_ACCEL) * dt)
-        elif inp.accel and self.speed < cruise:
-            self.speed = min(cruise, self.speed + ACCEL * dt)
-        elif not inp.accel:
+        else:
             self.speed -= FRICTION * dt
-        if not self.boosting and self.speed > cruise:
-            self.speed = max(cruise, self.speed - 260.0 * dt)
-        self.speed = max(0.0, self.speed)
+        self.speed += math.sin(slope) * course.gravity * 0.42 * dt
+        self.speed = max(-40.0, min(MAX_SPEED, self.speed))
+        self.vx = math.cos(slope) * self.speed
+        self.vy = math.sin(slope) * self.speed
 
-        if inp.jump and self.grounded:
-            self.vz = JUMP_SPEED
+        next_x = self.x + self.vx * dt
+        ground = course.ground(next_x)
+        flight_y = self.y + self.vy * dt + 0.5 * course.gravity * dt * dt
+        if ground is None or flight_y + RIDE < ground - 28.0:
             self.grounded = False
-            self.jumped = True
+            self.air_time = 0.0
+            self.air_spin = 0.0
+            self.just_landed = False
+            self.x = next_x
+            self.y = flight_y
+            return
+        self.x = next_x
+        self.y = ground - RIDE
+        self.angle = -course.slope(self.x)
+        self.air_time = 0.0
 
-        if not self.grounded:
-            self.vz -= GRAVITY * max(0.35, self.gravity_scale) * dt
-            self.z += self.vz * dt
-            if self.z <= 0.0:
-                self.z = 0.0
-                self.vz = 0.0
-                self.grounded = True
+    def _fly(self, dt: float, inp: Input, course):
+        self.air_time += dt
+        before = self.angle
+        rate = AIR_TURN * course.turn
+        if inp.gas:
+            self.angle += rate * dt
+        if inp.brake:
+            self.angle -= rate * dt
+        self.air_spin += abs(wrap(self.angle - before))
+        self.vy += course.gravity * dt
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        self._try_land(course)
+        if self.y > course.base + 260.0:
+            self._crash("FELL")
 
-        self.y -= self.speed * dt
-        if self.speed > 160:
-            self.trail.append(Vector2(self.pos))
-            if len(self.trail) > 16:
-                self.trail.pop(0)
-        elif self.trail:
-            self.trail.pop(0)
-
-    def bump(self):
-        self.speed *= 0.42
-        self.invuln = 1.05
-        self.shake = 9.0
-        self.z = 0.0
-        self.vz = 0.0
+    def _try_land(self, course):
+        if self.vy < 40.0:
+            return
+        ground = course.ground(self.x)
+        if ground is None:
+            return
+        lowest = min(self.local(lx, RIDE)[1] for lx in (-26.0, 30.0))
+        if lowest < ground:
+            return
+        target = -course.slope(self.x)
+        error = abs(wrap(self.angle - target))
+        if error > course.land:
+            self._crash("BAD LANDING")
+            return
+        self.just_landed = True
+        self.land_air = self.air_time
+        self.land_error = error
+        self.land_spin = self.air_spin
+        slope = course.slope(self.x)
         self.grounded = True
+        self.angle = -slope
+        self.y = ground - RIDE
+        self.speed = self.vx * math.cos(slope) + self.vy * math.sin(slope)
+        self.speed = max(80.0, min(MAX_SPEED, self.speed))
+        self.vx = math.cos(slope) * self.speed
+        self.vy = math.sin(slope) * self.speed
+        self.air_time = 0.0
+
+    def _crash(self, reason: str):
+        self.crashed = True
+        self.crash_reason = reason
+        self.grounded = False
+        self.speed = 0.0
